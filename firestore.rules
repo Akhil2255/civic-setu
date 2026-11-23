@@ -1,0 +1,170 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global default-deny safety net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Reusable hardened helpers
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isAdmin() {
+      return isVerifiedUser() && (
+        request.auth.token.email == 'akhilfrancis2255@gmail.com' ||
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'email', 'fullName', 'role', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'email', 'fullName', 'role', 'createdAt', 'updatedAt'])
+        && data.uid is string && data.uid == userId && isValidId(data.uid)
+        && data.email is string && data.email.size() >= 3 && data.email.size() <= 200
+        && data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 120
+        && data.role is string && data.role in ['citizen', 'company_admin', 'state_admin', 'district_admin', 'municipality_admin', 'department_admin', 'field_officer']
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidCivicIssue(data) {
+      return data.keys().hasAll(['complaintCode', 'reporterUid', 'title', 'description', 'category', 'severity', 'status', 'municipalityName', 'districtName', 'stateName', 'departmentName', 'latitude', 'longitude', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['complaintCode', 'reporterUid', 'title', 'description', 'category', 'severity', 'status', 'municipalityName', 'districtName', 'stateName', 'departmentName', 'latitude', 'longitude', 'createdAt', 'updatedAt'])
+        && data.complaintCode is string && data.complaintCode.size() >= 5 && data.complaintCode.size() <= 40 && isValidId(data.complaintCode)
+        && data.reporterUid is string && isValidId(data.reporterUid)
+        && data.title is string && data.title.size() >= 3 && data.title.size() <= 160
+        && data.description is string && data.description.size() >= 5 && data.description.size() <= 2000
+        && data.category is string && data.category.size() >= 2 && data.category.size() <= 80
+        && data.severity is string && data.severity in ['Low', 'Medium', 'High', 'Critical']
+        && data.status is string && data.status in ['Submitted', 'Under Review', 'Assigned to Department', 'Accepted by Department', 'Field Inspection', 'Work in Progress', 'Resolved', 'Citizen Verification', 'Closed', 'Reopened']
+        && data.municipalityName is string && data.municipalityName.size() >= 2 && data.municipalityName.size() <= 100
+        && data.districtName is string && data.districtName.size() >= 2 && data.districtName.size() <= 100
+        && data.stateName is string && data.stateName.size() >= 2 && data.stateName.size() <= 100
+        && data.departmentName is string && data.departmentName.size() >= 2 && data.departmentName.size() <= 120
+        && data.latitude is number && data.latitude >= -90 && data.latitude <= 90
+        && data.longitude is number && data.longitude >= -180 && data.longitude <= 180
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidRoadPassport(data) {
+      return data.keys().hasAll(['passportCode', 'assetName', 'departmentName', 'purpose', 'workStatus', 'createdByUid', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['passportCode', 'assetName', 'departmentName', 'purpose', 'workStatus', 'createdByUid', 'createdAt', 'updatedAt'])
+        && data.passportCode is string && data.passportCode.size() >= 4 && data.passportCode.size() <= 40 && isValidId(data.passportCode)
+        && data.assetName is string && data.assetName.size() >= 3 && data.assetName.size() <= 160
+        && data.departmentName is string && data.departmentName.size() >= 2 && data.departmentName.size() <= 120
+        && data.purpose is string && data.purpose.size() >= 3 && data.purpose.size() <= 300
+        && data.workStatus is string && data.workStatus in ['Planned', 'Excavation Active', 'Restoration Pending', 'Completed', 'Overdue', 'Flagged']
+        && data.createdByUid is string && isValidId(data.createdByUid)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Connection check document (read-only health probe)
+    match /test/connection {
+      allow get: if true;
+    }
+
+    // Admin registry (read-only to admins; managed via console or Admin SDK)
+    match /admins/{adminId} {
+      allow get: if isValidId(adminId) && isVerifiedUser() && (request.auth.uid == adminId || isAdmin());
+      allow list, create, update, delete: if false;
+    }
+
+    // User profiles (PII protected: owner or verified admin only; self-assigned role blocked to 'citizen')
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isVerifiedUser() && (request.auth.uid == userId || isAdmin());
+      allow list: if isAdmin();
+      allow create: if isValidId(userId)
+        && isVerifiedUser()
+        && request.auth.uid == userId
+        && isValidUserProfile(incoming(), userId)
+        && incoming().role == 'citizen'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(userId)
+        && isVerifiedUser()
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          (request.auth.uid == userId
+            && incoming().role == existing().role
+            && incoming().diff(existing()).affectedKeys().hasOnly(['fullName', 'updatedAt'])) ||
+          (isAdmin()
+            && incoming().diff(existing()).affectedKeys().hasOnly(['fullName', 'role', 'updatedAt']))
+        );
+      allow delete: if false;
+    }
+
+    // Civic Issues
+    match /issues/{issueId} {
+      allow get: if isValidId(issueId) && isVerifiedUser() && (existing().reporterUid == request.auth.uid || isAdmin());
+      allow list: if isVerifiedUser() && (resource.data.reporterUid == request.auth.uid || isAdmin());
+      allow create: if isValidId(issueId)
+        && isVerifiedUser()
+        && isValidCivicIssue(incoming())
+        && incoming().reporterUid == request.auth.uid
+        && incoming().status == 'Submitted'
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(issueId)
+        && isVerifiedUser()
+        && isValidCivicIssue(incoming())
+        && incoming().reporterUid == existing().reporterUid
+        && incoming().complaintCode == existing().complaintCode
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          (existing().status != 'Closed'
+            && existing().reporterUid == request.auth.uid
+            && incoming().status in ['Closed', 'Reopened']
+            && existing().status in ['Resolved', 'Citizen Verification']
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])) ||
+          (isAdmin()
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'severity', 'category', 'departmentName', 'updatedAt']))
+        );
+      allow delete: if false;
+    }
+
+    // Road Passports
+    match /road_passports/{passportId} {
+      allow get: if isValidId(passportId) && isVerifiedUser();
+      allow list: if isVerifiedUser() && (resource.data.createdByUid == request.auth.uid || isAdmin());
+      allow create: if isValidId(passportId)
+        && isAdmin()
+        && isValidRoadPassport(incoming())
+        && incoming().createdByUid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isValidId(passportId)
+        && isAdmin()
+        && isValidRoadPassport(incoming())
+        && incoming().createdByUid == existing().createdByUid
+        && incoming().passportCode == existing().passportCode
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly(['workStatus', 'purpose', 'departmentName', 'updatedAt']);
+      allow delete: if false;
+    }
+  }
+}

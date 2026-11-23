@@ -1,0 +1,6 @@
+{
+  "name": "PWD CONNECT",
+  "description": "AI-powered national civic infrastructure complaint management and Road Passport platform connecting citizens, municipalities, and government departments.",
+  "requestFramePermissions": ["geolocation", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
