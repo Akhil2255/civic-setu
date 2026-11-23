@@ -10,6 +10,7 @@ import {
   compareRepairPhotosWithAi,
   extractWhatsappComplaintWithAi,
   generateDashboardSummaryWithAi,
+  identifyIssueFromPhotoWithAi,
 } from './server/ai.ts';
 import {
   detectDuplicateIssues,
@@ -19,6 +20,7 @@ import {
 import {
   formatPhoneDisplay,
   formatWhatsappConfirmationReply,
+  matchNearestActiveMunicipality,
   normalizePhoneNumber,
 } from './src/lib/whatsappBot.ts';
 import {
@@ -354,7 +356,6 @@ const BASE_PASSPORT_SELECT = `
 interface AuthRequest extends Request {
   authUser?: UserAccount;
   fieldOfficerId?: string | null;
-  rawBody?: Buffer;
 }
 
 function resolveOptionalAuthUser(req: Request): UserAccount | null {
@@ -396,6 +397,75 @@ function getAllMunicipalities(): MunicipalityRecord[] {
       'SELECT id, state_id as stateId, district_id as districtId, name, type, status, center_lat as centerLat, center_lng as centerLng FROM municipalities ORDER BY name'
     )
     .all() as unknown as MunicipalityRecord[];
+}
+
+async function reverseGeocodeLocation(
+  latitude: number,
+  longitude: number
+): Promise<{
+  addressText: string;
+  nearestMunicipality: MunicipalityRecord | null;
+}> {
+  const activeMunis = getAllMunicipalities().filter((m) => !m.status || m.status === 'Active');
+  const nearestMunicipality = matchNearestActiveMunicipality(latitude, longitude, activeMunis);
+  const fallbackAddress = nearestMunicipality
+    ? `Near ${nearestMunicipality.name} Civic Corridor (${latitude.toFixed(5)}, ${longitude.toFixed(5)})`
+    : `GPS Location (${latitude.toFixed(5)}, ${longitude.toFixed(5)})`;
+
+  try {
+    const url = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${encodeURIComponent(latitude)}&lon=${encodeURIComponent(longitude)}&zoom=18&addressdetails=1`;
+    const resp = await fetch(url, {
+      headers: {
+        'User-Agent': 'CivilSetuCivicPlatform/1.0',
+        Accept: 'application/json',
+      },
+      signal: AbortSignal.timeout(2500),
+    });
+    if (!resp.ok) {
+      return { addressText: fallbackAddress, nearestMunicipality };
+    }
+    const data = (await resp.json()) as {
+      display_name?: string;
+      address?: {
+        road?: string;
+        pedestrian?: string;
+        neighbourhood?: string;
+        suburb?: string;
+        amenity?: string;
+        building?: string;
+        village?: string;
+        town?: string;
+        city?: string;
+        county?: string;
+        state_district?: string;
+        postcode?: string;
+      };
+    };
+    const a = data.address || {};
+    const parts = [
+      a.amenity || a.building,
+      a.road || a.pedestrian,
+      a.neighbourhood || a.suburb,
+      a.village || a.town || a.city || nearestMunicipality?.name,
+      a.state_district || a.county,
+      a.postcode,
+    ].filter((p): p is string => Boolean(p && p.trim()));
+
+    const uniqueParts = Array.from(new Set(parts));
+    const addressText =
+      uniqueParts.length >= 2
+        ? uniqueParts.join(', ')
+        : data.display_name
+          ? data.display_name.split(',').slice(0, 4).join(',').trim()
+          : fallbackAddress;
+
+    return {
+      addressText: addressText || fallbackAddress,
+      nearestMunicipality,
+    };
+  } catch {
+    return { addressText: fallbackAddress, nearestMunicipality };
+  }
 }
 
 function resolveOrCreateWhatsappCitizen(phone: string, fallbackMuni?: MunicipalityRecord | null): UserAccount {
@@ -449,30 +519,6 @@ function mapWhatsappMessageRow(row: any): WhatsappMessageRecord {
   };
 }
 
-async function sendMetaCloudWhatsappMessage(toPhone: string, bodyText: string): Promise<void> {
-  const token = process.env.WHATSAPP_ACCESS_TOKEN;
-  const phoneId = process.env.WHATSAPP_PHONE_NUMBER_ID;
-  if (!token || !phoneId) return;
-  try {
-    const toDigits = normalizePhoneNumber(toPhone).replace(/\D/g, '');
-    await fetch(`https://graph.facebook.com/v21.0/${encodeURIComponent(phoneId)}/messages`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        messaging_product: 'whatsapp',
-        to: toDigits,
-        type: 'text',
-        text: { body: bodyText },
-      }),
-    });
-  } catch (err) {
-    console.error('Meta WhatsApp outbound send failed (logged locally):', err);
-  }
-}
-
 function notifyWhatsappChannelOnIssueUpdate(issue: CivicIssue, messageText: string) {
   if (issue.channel !== 'whatsapp' && !issue.reporterPhone) return;
   const phoneToUse = issue.reporterPhone ? normalizePhoneNumber(issue.reporterPhone) : null;
@@ -488,7 +534,6 @@ function notifyWhatsappChannelOnIssueUpdate(issue: CivicIssue, messageText: stri
      VALUES (?, ?, ?, 'outbound', ?, NULL, ?, 'web_simulator', ?)`
   ).run(msgId, sessionRow.id, sessionRow.phone_number, messageText, issue.complaintCode, nowIso);
   db.prepare('UPDATE whatsapp_sessions SET updated_at = ? WHERE id = ?').run(nowIso, sessionRow.id);
-  void sendMetaCloudWhatsappMessage(sessionRow.phone_number, messageText);
 }
 
 async function createCivicIssuePipeline(params: {
@@ -749,6 +794,7 @@ async function createCivicIssuePipeline(params: {
        VALUES (?, ?, ?, ?, ?)`
     ).run(`asg-${crypto.randomUUID().slice(0, 8)}`, issueId, routing.departmentId, params.user.id, nowIso);
 
+    const locText = (typeof params.addressText === 'string' && params.addressText.trim()) || `${muni.name}, Kerala`;
     const deptUsers = db
       .prepare("SELECT id FROM users WHERE role = 'department_admin' AND department_id = ? AND (municipality_id = ? OR municipality_id IS NULL)")
       .all(routing.departmentId, muni.id) as Array<{ id: string }>;
@@ -758,12 +804,13 @@ async function createCivicIssuePipeline(params: {
         issueId,
         complaintCode,
         title: `New ${channel === 'whatsapp' ? 'WhatsApp ' : ''}Complaint Routed: ${complaintCode}`,
-        message: `${finalCategory} (${aiAnalysis.severity}) reported in ${muni.name}: "${params.title.trim()}".`,
+        message: `${finalCategory} (${aiAnalysis.severity}) in ${muni.name}: "${params.title.trim()}" · Location: ${locText} (GPS ${lat.toFixed(5)}, ${lng.toFixed(5)}).`,
         eventType: 'department_assigned',
       });
     }
   }
 
+  const muniLocText = (typeof params.addressText === 'string' && params.addressText.trim()) || `${muni.name}, Kerala`;
   const muniAdmins = db
     .prepare("SELECT id FROM users WHERE role = 'municipality_admin' AND municipality_id = ?")
     .all(muni.id) as Array<{ id: string }>;
@@ -773,7 +820,7 @@ async function createCivicIssuePipeline(params: {
       issueId,
       complaintCode,
       title: `New ${channel === 'whatsapp' ? 'WhatsApp ' : ''}Civic Issue in ${muni.name}`,
-      message: `${complaintCode} (${finalCategory}) ${routing.departmentName ? `assigned to ${routing.departmentName}` : 'queued for manual review'}.`,
+      message: `${complaintCode} (${finalCategory}) ${routing.departmentName ? `assigned to ${routing.departmentName}` : 'queued for manual review'} · Location: ${muniLocText} (GPS ${lat.toFixed(5)}, ${lng.toFixed(5)}).`,
       eventType: 'municipality_alert',
     });
   }
@@ -809,14 +856,7 @@ async function createCivicIssuePipeline(params: {
 
 async function startServer() {
   const app = express();
-  app.use(
-    express.json({
-      limit: '12mb',
-      verify: (req: any, _res, buf) => {
-        req.rawBody = buf;
-      },
-    })
-  );
+  app.use(express.json({ limit: '12mb' }));
 
   // Secure static serving for uploaded photos
   app.get('/uploads/:filename', (req, res) => {
@@ -1120,6 +1160,112 @@ async function startServer() {
     } catch (error: any) {
       console.error('AI analysis error:', error);
       res.status(500).json({ error: error?.message || 'AI analysis failed.' });
+    }
+  });
+
+  // Reverse Geocode Coordinates -> Street Address / Landmark + Nearest Active Municipality
+  app.get('/api/geo/reverse', async (req, res) => {
+    const lat = Number(req.query.lat);
+    const lng = Number(req.query.lng);
+    if (!Number.isFinite(lat) || lat < -90 || lat > 90 || !Number.isFinite(lng) || lng < -180 || lng > 180) {
+      res.status(400).json({ error: 'Valid latitude and longitude are required.' });
+      return;
+    }
+    const geo = await reverseGeocodeLocation(lat, lng);
+    res.json({
+      latitude: lat,
+      longitude: lng,
+      addressText: geo.addressText,
+      nearestMunicipality: geo.nearestMunicipality,
+    });
+  });
+
+  // AI Auto-Identify Issue Title, Description, Category & Routing from Uploaded Photo
+  app.post('/api/ai/identify-photo', requireAuth, async (req: AuthRequest, res) => {
+    try {
+      const { imageBase64, mimeType, filename, municipalityId, addressText, latitude, longitude } = req.body ?? {};
+      if (typeof imageBase64 !== 'string' || !imageBase64.trim()) {
+        res.status(400).json({ error: 'Uploaded image data is required for AI identification.' });
+        return;
+      }
+
+      const decoded = readUploadAsBase64(imageBase64.trim());
+      if (!decoded) {
+        res.status(400).json({ error: 'Unsupported or invalid image data.' });
+        return;
+      }
+
+      const muni = municipalityId
+        ? (db.prepare('SELECT id, name FROM municipalities WHERE id = ?').get(municipalityId) as { id: string; name: string } | undefined)
+        : undefined;
+
+      const identified = await identifyIssueFromPhotoWithAi({
+        imageBase64: decoded.base64,
+        mimeType: decoded.mimeType || mimeType,
+        filename: typeof filename === 'string' ? filename : undefined,
+        municipalityName: muni?.name,
+        addressText: typeof addressText === 'string' ? addressText : undefined,
+      });
+
+      const routing = municipalityId
+        ? routeIssueToDepartment({
+            category: identified.suggestedCategory,
+            confidence: identified.confidence,
+            municipalityId,
+            jurisdictions: getJurisdictionsWithNames(),
+            categoryConfigs: getCategoryConfigs(),
+          })
+        : null;
+
+      const existingRows = db
+        .prepare('SELECT id, complaint_code as complaintCode, title, description, category, status, latitude, longitude FROM issues')
+        .all() as any[];
+
+      const duplicates =
+        typeof latitude === 'number' && typeof longitude === 'number'
+          ? detectDuplicateIssues({
+              title: identified.title,
+              description: identified.description,
+              category: identified.suggestedCategory,
+              latitude,
+              longitude,
+              existingIssues: existingRows,
+            })
+          : [];
+
+      const passportRows = db.prepare(BASE_PASSPORT_SELECT).all() as any[];
+      const passports = passportRows.map(hydratePassportRow);
+      const repeatExcavation =
+        typeof latitude === 'number' && typeof longitude === 'number'
+          ? detectRepeatRoadExcavations({ latitude, longitude, existingPassports: passports })
+          : { isRepeatZone: false, nearbyPassports: [], totalPriorExcavations: 0 };
+
+      res.json({
+        identified,
+        analysis: {
+          suggestedCategory: identified.suggestedCategory,
+          severity: identified.severity,
+          confidence: identified.confidence,
+          summary: identified.title,
+          reasoning: identified.reasoning,
+          source: identified.source,
+        },
+        routing,
+        duplicates,
+        repeatExcavation: {
+          isRepeatZone: repeatExcavation.isRepeatZone,
+          totalPriorExcavations: repeatExcavation.totalPriorExcavations,
+          nearbyPassports: repeatExcavation.nearbyPassports.map((p) => ({
+            passportCode: p.passportCode,
+            assetName: p.assetName,
+            workStatus: p.workStatus,
+            repeatDigCount: p.repeatDigCount,
+          })),
+        },
+      });
+    } catch (error: any) {
+      console.error('AI photo identify error:', error);
+      res.status(500).json({ error: error?.message || 'Failed to identify issue from photo.' });
     }
   });
 
@@ -2855,6 +3001,7 @@ async function startServer() {
     explicitMunicipalityId?: string | null;
     latitude?: number;
     longitude?: number;
+    addressText?: string;
     photoDataUrl?: string;
     authUser?: UserAccount | null;
   }) {
@@ -2879,12 +3026,17 @@ async function startServer() {
       uploadedMediaUrl = draft.photoDataUrl;
     }
 
+    const effectiveLat = typeof params.latitude === 'number' && !Number.isNaN(params.latitude) ? params.latitude : draft?.latitude;
+    const effectiveLng = typeof params.longitude === 'number' && !Number.isNaN(params.longitude) ? params.longitude : draft?.longitude;
+
     const imageInfo = uploadedMediaUrl ? readUploadAsBase64(uploadedMediaUrl) : null;
     const parsed = await extractWhatsappComplaintWithAi({
       message: params.message,
       municipalities: activeMunis,
       draft,
       explicitMunicipalityId: params.explicitMunicipalityId,
+      latitude: effectiveLat,
+      longitude: effectiveLng,
       imageBase64: imageInfo?.base64,
       mimeType: imageInfo?.mimeType,
     });
@@ -3051,15 +3203,26 @@ async function startServer() {
           `Active places: ${placeNames}`,
         ].join('\n');
       } else {
+        const finalLat = effectiveLat ?? parsed.matchedMunicipality.centerLat;
+        const finalLng = effectiveLng ?? parsed.matchedMunicipality.centerLng;
+        let autoAddress = params.addressText?.trim() || draft?.addressText || '';
+        if (!autoAddress && typeof effectiveLat === 'number' && typeof effectiveLng === 'number') {
+          const geo = await reverseGeocodeLocation(finalLat, finalLng);
+          autoAddress = geo.addressText;
+        }
+        if (!autoAddress) {
+          autoAddress = parsed.addressHint || `${parsed.matchedMunicipality.name}, Kerala`;
+        }
+
         const result = await createCivicIssuePipeline({
           user: citizenUser,
           title: parsed.title,
           description: parsed.description,
           category: 'Auto-Detect with AI',
           municipalityId: parsed.matchedMunicipality.id,
-          addressText: parsed.addressHint || `${parsed.matchedMunicipality.name}, Kerala`,
-          latitude: params.latitude ?? draft?.latitude ?? parsed.matchedMunicipality.centerLat,
-          longitude: params.longitude ?? draft?.longitude ?? parsed.matchedMunicipality.centerLng,
+          addressText: autoAddress,
+          latitude: finalLat,
+          longitude: finalLng,
           photoDataUrl: uploadedMediaUrl || undefined,
           channel: 'whatsapp',
           reporterPhone: normalizedPhone,
@@ -3078,6 +3241,9 @@ async function startServer() {
           slaHours: result.routing.slaHours,
           hasRoadPassport: result.hasRoadPassport,
           duplicateCode: result.duplicates[0]?.complaintCode ?? null,
+          addressText: result.issue.addressText,
+          latitude: result.issue.latitude,
+          longitude: result.issue.longitude,
         });
       }
     }
@@ -3103,10 +3269,6 @@ async function startServer() {
       sessionRow.id
     );
 
-    if (params.channelMode === 'meta_webhook') {
-      void sendMetaCloudWhatsappMessage(normalizedPhone, replyText);
-    }
-
     const updatedSession = db.prepare('SELECT * FROM whatsapp_sessions WHERE id = ?').get(sessionRow.id) as any;
     const messages = (
       db
@@ -3131,9 +3293,13 @@ async function startServer() {
     };
   }
 
-  // Interactive Web WhatsApp Bot Session Loader
+  // Interactive Web WhatsApp Bot Session Loader (Civilians Only)
   app.get('/api/whatsapp/session', (req, res) => {
     const authUser = resolveOptionalAuthUser(req);
+    if (authUser && authUser.role !== 'citizen') {
+      res.status(403).json({ error: 'The WhatsApp reporting chatbot is restricted to civilians only.' });
+      return;
+    }
     const rawPhone = String(req.query.phone || authUser?.phone || '+91 98470 20001');
     const normalizedPhone = normalizePhoneNumber(rawPhone);
     const sessionRow = db.prepare('SELECT * FROM whatsapp_sessions WHERE phone_number = ?').get(normalizedPhone) as any;
@@ -3158,15 +3324,18 @@ async function startServer() {
         : null,
       phoneNumber: normalizedPhone,
       messages,
-      cloudApiConfigured: Boolean(process.env.WHATSAPP_ACCESS_TOKEN && process.env.WHATSAPP_PHONE_NUMBER_ID),
     });
   });
 
-  // Interactive Web WhatsApp Bot Message Endpoint
+  // Interactive Web WhatsApp Bot Message Endpoint (Civilians Only)
   app.post('/api/whatsapp/chat', async (req, res) => {
     try {
       const authUser = resolveOptionalAuthUser(req);
-      const { phone, message, municipalityId, latitude, longitude, photoDataUrl } = req.body ?? {};
+      if (authUser && authUser.role !== 'citizen') {
+        res.status(403).json({ error: 'The WhatsApp reporting chatbot is restricted to civilians only.' });
+        return;
+      }
+      const { phone, message, municipalityId, latitude, longitude, addressText, photoDataUrl } = req.body ?? {};
       const msgText = String(message || '').trim();
       if (!msgText && !photoDataUrl) {
         res.status(400).json({ error: 'Please enter a message or attach a photo to send to the WhatsApp Bot.' });
@@ -3185,6 +3354,7 @@ async function startServer() {
         explicitMunicipalityId: typeof municipalityId === 'string' && municipalityId ? municipalityId : null,
         latitude: typeof latitude === 'number' && !Number.isNaN(latitude) ? latitude : undefined,
         longitude: typeof longitude === 'number' && !Number.isNaN(longitude) ? longitude : undefined,
+        addressText: typeof addressText === 'string' && addressText.trim() ? addressText.trim() : undefined,
         photoDataUrl: typeof photoDataUrl === 'string' && photoDataUrl.startsWith('data:image/') ? photoDataUrl : undefined,
         authUser,
       });
@@ -3193,123 +3363,6 @@ async function startServer() {
     } catch (error: any) {
       console.error('WhatsApp bot chat error:', error);
       res.status(error?.statusCode || 500).json({ error: error?.message || 'Failed to process WhatsApp message.' });
-    }
-  });
-
-  // Admin / Governance WhatsApp Intake Monitor
-  app.get('/api/whatsapp/intake-logs', requireAuth, (req: AuthRequest, res) => {
-    const user = req.authUser!;
-    if (!['company_admin', 'state_admin', 'district_admin', 'municipality_admin', 'department_admin'].includes(user.role)) {
-      res.status(403).json({ error: 'Administrator or department access required.' });
-      return;
-    }
-
-    const allWhatsappIssues = (
-      db.prepare(`${BASE_ISSUE_SELECT} WHERE i.channel = 'whatsapp' ORDER BY i.created_at DESC`).all() as any[]
-    )
-      .map(hydrateIssueRow)
-      .filter((iss) => canUserAccessIssue(user, iss, req.fieldOfficerId));
-
-    const recentMessages = (
-      db.prepare('SELECT * FROM whatsapp_messages ORDER BY created_at DESC LIMIT 40').all() as any[]
-    ).map(mapWhatsappMessageRow);
-
-    res.json({
-      issues: allWhatsappIssues,
-      recentMessages,
-      integration: {
-        webhookPath: '/api/webhooks/whatsapp',
-        verifyTokenConfigured: Boolean(process.env.WHATSAPP_VERIFY_TOKEN),
-        appSecretConfigured: Boolean(process.env.WHATSAPP_APP_SECRET),
-        cloudApiConfigured: Boolean(process.env.WHATSAPP_ACCESS_TOKEN && process.env.WHATSAPP_PHONE_NUMBER_ID),
-      },
-    });
-  });
-
-  // Meta WhatsApp Cloud API Webhook Verification (GET)
-  app.get('/api/webhooks/whatsapp', (req, res) => {
-    const mode = String(req.query['hub.mode'] || '');
-    const token = String(req.query['hub.verify_token'] || '');
-    const challenge = String(req.query['hub.challenge'] || '');
-    const expectedToken = process.env.WHATSAPP_VERIFY_TOKEN;
-
-    if (mode === 'subscribe' && challenge) {
-      if (expectedToken && token !== expectedToken) {
-        res.status(403).send('Verification token mismatch.');
-        return;
-      }
-      res.status(200).send(challenge);
-      return;
-    }
-    res.status(400).send('Invalid WhatsApp webhook verification query.');
-  });
-
-  // Meta WhatsApp Cloud API Inbound Webhook (POST)
-  app.post('/api/webhooks/whatsapp', async (req: AuthRequest, res) => {
-    try {
-      const appSecret = process.env.WHATSAPP_APP_SECRET;
-      if (appSecret) {
-        const sigHeader = String(req.headers['x-hub-signature-256'] || '');
-        const rawBuf = req.rawBody || Buffer.from(JSON.stringify(req.body || {}));
-        const expected = `sha256=${crypto.createHmac('sha256', appSecret).update(rawBuf).digest('hex')}`;
-        const a = Buffer.from(sigHeader);
-        const b = Buffer.from(expected);
-        if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
-          res.status(401).json({ error: 'Invalid Meta webhook signature.' });
-          return;
-        }
-      }
-
-      const entries = Array.isArray(req.body?.entry) ? req.body.entry : [];
-      const processed: Array<{ phone: string; complaintCode?: string | null; reply: string }> = [];
-
-      for (const entry of entries) {
-        const changes = Array.isArray(entry?.changes) ? entry.changes : [];
-        for (const change of changes) {
-          const messages = Array.isArray(change?.value?.messages) ? change.value.messages : [];
-          for (const msg of messages) {
-            const fromPhone = String(msg?.from || '');
-            if (!fromPhone) continue;
-
-            let textBody = '';
-            let lat: number | undefined;
-            let lng: number | undefined;
-
-            if (msg.type === 'text' && msg.text?.body) {
-              textBody = String(msg.text.body);
-            } else if (msg.type === 'location' && msg.location) {
-              lat = Number(msg.location.latitude);
-              lng = Number(msg.location.longitude);
-              textBody = String(msg.location.address || msg.location.name || `Location pin ${lat}, ${lng}`);
-            } else if (msg.type === 'interactive') {
-              textBody = String(
-                msg.interactive?.button_reply?.title || msg.interactive?.list_reply?.title || ''
-              );
-            } else if (msg.image?.caption) {
-              textBody = String(msg.image.caption);
-            }
-
-            if (!textBody.trim()) continue;
-            const turn = await processInboundWhatsappTurn({
-              phone: fromPhone,
-              message: textBody,
-              channelMode: 'meta_webhook',
-              latitude: lat,
-              longitude: lng,
-            });
-            processed.push({
-              phone: normalizePhoneNumber(fromPhone),
-              complaintCode: turn.createdIssue?.complaintCode || turn.linkedIssue?.complaintCode || null,
-              reply: turn.reply,
-            });
-          }
-        }
-      }
-
-      res.status(200).json({ ok: true, processedCount: processed.length, processed });
-    } catch (error: any) {
-      console.error('Meta WhatsApp webhook error:', error);
-      res.status(500).json({ error: 'Webhook processing failed.' });
     }
   });
 

@@ -31,10 +31,10 @@ import { IssueDetailModal } from './IssueDetailModal';
 import { LocationManagerPanel } from './LocationManagerPanel';
 import { Logo } from './Logo';
 import { ReportIssueView } from './ReportIssueView';
+import { RoadPassportTracker } from './RoadPassportTracker';
 import { RoadPassportView } from './RoadPassportView';
 import { SeverityLabel, StatusLabel } from './StatusComponents';
 import { WhatsappBotWidget } from './WhatsappBotWidget';
-import { WhatsappIntakeMonitor } from './WhatsappIntakeMonitor';
 
 type WorkspaceTab =
   | 'overview'
@@ -178,9 +178,9 @@ export const DashboardWorkspace: React.FC<DashboardWorkspaceProps> = ({
     { id: 'report', label: 'Report an Issue', icon: <FilePlus2 className="w-4 h-4" />, show: user.role === 'citizen' },
     {
       id: 'whatsapp',
-      label: user.role === 'citizen' ? 'WhatsApp Bot' : 'WhatsApp Intake',
+      label: 'WhatsApp Bot',
       icon: <MessageCircle className="w-4 h-4" />,
-      show: user.role !== 'field_officer',
+      show: user.role === 'citizen',
     },
     {
       id: 'complaints',
@@ -450,6 +450,20 @@ export const DashboardWorkspace: React.FC<DashboardWorkspaceProps> = ({
                 </div>
               </div>
 
+              {/* Road Passport Complaint Lifecycle Status Tracker (Citizen Dashboard) */}
+              {user.role === 'citizen' && (
+                <RoadPassportTracker
+                  issues={issues}
+                  passports={passports}
+                  onOpenIssue={(issueId) => setSelectedIssueId(issueId)}
+                  onOpenRoadPassport={(rpId) => {
+                    setSelectedPassportId(rpId);
+                    setActiveTab('road_passport');
+                  }}
+                  onReportNew={() => setActiveTab('report')}
+                />
+              )}
+
               {/* Manual Review Queue Alert for Company/Gov Admins */}
               {['company_admin', 'state_admin', 'district_admin'].includes(user.role) &&
                 issues.some((i) => i.routingStatus === 'manual_review') && (
@@ -609,38 +623,29 @@ export const DashboardWorkspace: React.FC<DashboardWorkspaceProps> = ({
             />
           )}
 
-          {/* WHATSAPP BOT / INTAKE TAB */}
-          {activeTab === 'whatsapp' && (
-            user.role === 'citizen' ? (
-              <div className="space-y-5">
-                <div>
-                  <h1 className="text-2xl font-bold text-[#0B1F3A] tracking-tight">
-                    WhatsApp Civic Chatbot
-                  </h1>
-                  <p className="text-sm text-slate-600">
-                    Report potholes, broken streetlights, water leaks, or drainage issues via chat. Every complaint enters the full Civil Setu resolution queue with Road Passports and live tracking.
-                  </p>
-                </div>
-                <WhatsappBotWidget
-                  taxonomy={taxonomy}
-                  defaultPhone={user.phone || '+91 98470 20001'}
-                  onIssueCreated={async () => {
-                    await refreshWorkspace();
-                  }}
-                  onOpenComplaint={(code) => {
-                    const matched = issues.find((i) => i.complaintCode === code);
-                    setSelectedIssueId(matched ? matched.id : code);
-                  }}
-                />
+          {/* WHATSAPP BOT TAB (CIVILIAN ONLY) */}
+          {activeTab === 'whatsapp' && user.role === 'citizen' && (
+            <div className="space-y-5">
+              <div>
+                <h1 className="text-2xl font-bold text-[#0B1F3A] tracking-tight">
+                  WhatsApp Civic Chatbot
+                </h1>
+                <p className="text-sm text-slate-600">
+                  Report potholes, broken streetlights, water leaks, or drainage issues via chat. Your location and GPS coordinates are automatically sent to the responsible authority queue with full controls.
+                </p>
               </div>
-            ) : (
-              <WhatsappIntakeMonitor
-                user={user}
+              <WhatsappBotWidget
                 taxonomy={taxonomy}
-                onOpenIssue={(issueId) => setSelectedIssueId(issueId)}
-                onRefreshWorkspace={refreshWorkspace}
+                defaultPhone={user.phone || '+91 98470 20001'}
+                onIssueCreated={async () => {
+                  await refreshWorkspace();
+                }}
+                onOpenComplaint={(code) => {
+                  const matched = issues.find((i) => i.complaintCode === code);
+                  setSelectedIssueId(matched ? matched.id : code);
+                }}
               />
-            )
+            </div>
           )}
 
           {/* COMPLAINTS TABLE + FILTERS TAB */}

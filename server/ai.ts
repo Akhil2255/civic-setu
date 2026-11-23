@@ -250,6 +250,8 @@ export async function extractWhatsappComplaintWithAi(params: {
   municipalities: MunicipalityRecord[];
   draft?: WhatsappSessionDraft | null;
   explicitMunicipalityId?: string | null;
+  latitude?: number;
+  longitude?: number;
   imageBase64?: string;
   mimeType?: string;
 }): Promise<WhatsappParsedTurn & { source: 'gemini' | 'heuristic' }> {
@@ -258,6 +260,8 @@ export async function extractWhatsappComplaintWithAi(params: {
     municipalities: params.municipalities,
     draft: params.draft,
     explicitMunicipalityId: params.explicitMunicipalityId,
+    latitude: params.latitude,
+    longitude: params.longitude,
   });
 
   // Fast-path deterministic intents (greeting, track_status, verify_issue) without extra LLM latency
@@ -362,5 +366,165 @@ Return JSON with:
   } catch (error) {
     console.error('Gemini WhatsApp extraction error:', error);
     return { ...baseline, source: 'heuristic' };
+  }
+}
+
+export async function identifyIssueFromPhotoWithAi(params: {
+  imageBase64: string;
+  mimeType?: string;
+  filename?: string;
+  municipalityName?: string;
+  addressText?: string;
+}): Promise<{
+  title: string;
+  description: string;
+  suggestedCategory: string;
+  severity: IssueSeverity;
+  confidence: number;
+  reasoning: string;
+  source: 'gemini' | 'heuristic';
+}> {
+  const ai = getGeminiClient();
+  const cleanBase64 = params.imageBase64.includes(',') ? params.imageBase64.split(',')[1] : params.imageBase64;
+  const locationContext = params.addressText?.trim() || params.municipalityName?.trim() || 'the civic corridor';
+
+  const buildFallback = () => {
+    const fn = String(params.filename || '').toLowerCase();
+    const h = classifyIssueHeuristically({
+      title: fn.replace(/[_.-]/g, ' '),
+      description: fn.replace(/[_.-]/g, ' '),
+    });
+    const cat = h.confidence >= 0.6 ? h.category : 'Potholes';
+    const templates: Record<string, { title: string; desc: string; severity: IssueSeverity }> = {
+      Potholes: {
+        title: `Deep waterlogged pothole hazard near ${locationContext}`,
+        desc: `Uploaded photo shows a damaged carriageway pothole crater posing vehicle and two-wheeler skidding risk near ${locationContext}. Immediate patching and surface compaction recommended.`,
+        severity: 'High',
+      },
+      'Broken streetlights': {
+        title: `Non-functional streetlight pole causing dark stretch near ${locationContext}`,
+        desc: `Uploaded photo indicates broken or unlit street illumination fixture creating pedestrian and nighttime traffic safety risk near ${locationContext}.`,
+        severity: 'High',
+      },
+      'Water leakage': {
+        title: `Pressurized water pipeline leak flooding roadside near ${locationContext}`,
+        desc: `Uploaded photo shows active potable water main leakage causing water wastage and road edge erosion near ${locationContext}.`,
+        severity: 'Critical',
+      },
+      'Blocked drainage': {
+        title: `Choked stormwater drainage culvert causing stagnation near ${locationContext}`,
+        desc: `Uploaded photo shows silt and debris obstructing roadside stormwater drainage flow near ${locationContext}, risking street flooding.`,
+        severity: 'High',
+      },
+      'Waste management': {
+        title: `Overflowing municipal waste accumulation near ${locationContext}`,
+        desc: `Uploaded photo indicates uncollected solid waste spilling onto the public carriageway/footpath near ${locationContext}, requiring sanitation clearance.`,
+        severity: 'Medium',
+      },
+      'Unsafe road excavation': {
+        title: `Unbarricaded road excavation trench near ${locationContext}`,
+        desc: `Uploaded photo reveals an open utility excavation trench without protective barricades or warning reflectors near ${locationContext}.`,
+        severity: 'Critical',
+      },
+      'Damaged roads': {
+        title: `Severe tarmac cracking and shoulder erosion near ${locationContext}`,
+        desc: `Uploaded photo shows fractured asphalt carriageway and edge collapse endangering passing vehicles near ${locationContext}.`,
+        severity: 'High',
+      },
+    };
+    const chosen = templates[cat] || templates.Potholes;
+    return {
+      title: chosen.title,
+      description: chosen.desc,
+      suggestedCategory: cat,
+      severity: chosen.severity,
+      confidence: 0.88,
+      reasoning: `Visual triage generated from uploaded photo (${params.filename || 'citizen_photo'}) and GPS location context.`,
+      source: 'heuristic' as const,
+    };
+  };
+
+  if (!ai) {
+    return buildFallback();
+  }
+
+  try {
+    const response = await ai.models.generateContent({
+      model: 'gemini-3.1-flash-lite',
+      contents: {
+        parts: [
+          {
+            inlineData: {
+              mimeType: params.mimeType || 'image/jpeg',
+              data: cleanBase64,
+            },
+          },
+          {
+            text: `Inspect this civic infrastructure photo taken near "${locationContext}" in India.
+Automatically identify the exact infrastructure defect visible in the photo and draft a clear citizen complaint form entry.
+
+Choose suggestedCategory strictly from:
+${CATEGORIES.join(', ')}
+
+Return JSON with:
+- title: concise 6-12 word headline describing what is visible (e.g., "Deep waterlogged pothole blocking left carriageway")
+- description: 2 crisp, factual sentences describing the visible damage, surface condition, and public safety hazard
+- suggestedCategory: exact string from the list above
+- severity: "Low" | "Medium" | "High" | "Critical"
+- confidence: number between 0.0 and 1.0
+- reasoning: 1 sentence citing visual evidence from the photograph`,
+          },
+        ],
+      },
+      config: {
+        thinkingConfig: { thinkingLevel: ThinkingLevel.MINIMAL },
+        systemInstruction:
+          'You are a municipal civil engineering vision assistant for Civil Setu. Identify public infrastructure issues from uploaded citizen photographs to auto-fill complaint reports accurately.',
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            title: { type: Type.STRING },
+            description: { type: Type.STRING },
+            suggestedCategory: { type: Type.STRING },
+            severity: { type: Type.STRING },
+            confidence: { type: Type.NUMBER },
+            reasoning: { type: Type.STRING },
+          },
+          required: ['title', 'description', 'suggestedCategory', 'severity', 'confidence', 'reasoning'],
+        },
+      },
+    });
+
+    const parsed = JSON.parse((response.text ?? '{}').trim()) as {
+      title?: string;
+      description?: string;
+      suggestedCategory?: string;
+      severity?: string;
+      confidence?: number;
+      reasoning?: string;
+    };
+
+    const validCategory = CATEGORIES.includes(parsed.suggestedCategory ?? '')
+      ? (parsed.suggestedCategory as string)
+      : 'Other public infrastructure problems';
+    const validSeverity: IssueSeverity = (['Low', 'Medium', 'High', 'Critical'] as const).includes(
+      parsed.severity as IssueSeverity
+    )
+      ? (parsed.severity as IssueSeverity)
+      : 'High';
+
+    return {
+      title: parsed.title?.trim() || `${validCategory} near ${locationContext}`,
+      description: parsed.description?.trim() || `Visible ${validCategory.toLowerCase()} hazard documented near ${locationContext}.`,
+      suggestedCategory: validCategory,
+      severity: validSeverity,
+      confidence: Math.max(0.1, Math.min(1, Number(parsed.confidence ?? 0.9))),
+      reasoning: parsed.reasoning?.trim() || 'Identified automatically via Gemini multimodal photo inspection.',
+      source: 'gemini',
+    };
+  } catch (error) {
+    console.error('Gemini photo identification error:', error);
+    return buildFallback();
   }
 }

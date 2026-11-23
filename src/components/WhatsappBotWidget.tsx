@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   Camera,
   CheckCheck,
+  Crosshair,
   ExternalLink,
   MapPin,
   MessageCircle,
@@ -30,20 +31,23 @@ export const WhatsappBotWidget: React.FC<WhatsappBotWidgetProps> = ({
   onIssueCreated,
   onOpenComplaint,
 }) => {
+  const activeMunicipalities = taxonomy.municipalities.filter((m) => !m.status || m.status === 'Active');
+  const defaultMuni = activeMunicipalities.find((m) => m.id === 'mun-mlt') || activeMunicipalities[0];
+
   const [phone, setPhone] = useState(defaultPhone || '+91 98470 20001');
   const [message, setMessage] = useState('');
-  const [municipalityId, setMunicipalityId] = useState('');
+  const [municipalityId, setMunicipalityId] = useState(defaultMuni?.id || '');
+  const [geoLat, setGeoLat] = useState<number>(defaultMuni?.centerLat ?? 9.8981);
+  const [geoLng, setGeoLng] = useState<number>(defaultMuni?.centerLng ?? 76.3854);
+  const [detectedAddress, setDetectedAddress] = useState('');
+  const [geoMode, setGeoMode] = useState<'detecting' | 'device' | 'area'>('detecting');
   const [photoDataUrl, setPhotoDataUrl] = useState('');
-  const [attachGps, setAttachGps] = useState(true);
   const [messages, setMessages] = useState<WhatsappMessageRecord[]>([]);
-  const [cloudApiConfigured, setCloudApiConfigured] = useState(false);
   const [lastAiSource, setLastAiSource] = useState<'gemini' | 'heuristic' | null>(null);
   const [loadingSession, setLoadingSession] = useState(false);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState('');
   const endRef = useRef<HTMLDivElement | null>(null);
-
-  const activeMunicipalities = taxonomy.municipalities.filter((m) => !m.status || m.status === 'Active');
 
   const loadSession = async (targetPhone: string) => {
     setLoadingSession(true);
@@ -51,7 +55,6 @@ export const WhatsappBotWidget: React.FC<WhatsappBotWidgetProps> = ({
     try {
       const res = await api.getWhatsappSession(targetPhone);
       setMessages(res.messages);
-      setCloudApiConfigured(res.cloudApiConfigured);
     } catch (err: any) {
       setError(err.message || 'Unable to load WhatsApp session.');
     } finally {
@@ -59,13 +62,62 @@ export const WhatsappBotWidget: React.FC<WhatsappBotWidgetProps> = ({
     }
   };
 
+  const resolveLocationAndAddress = async (lat: number, lng: number, modeTag: 'device' | 'area') => {
+    setGeoLat(Number(lat.toFixed(6)));
+    setGeoLng(Number(lng.toFixed(6)));
+    setGeoMode(modeTag);
+    try {
+      const res = await api.reverseGeocode(lat, lng);
+      if (res.addressText) {
+        setDetectedAddress(res.addressText);
+      }
+      if (res.nearestMunicipality?.id) {
+        setMunicipalityId(res.nearestMunicipality.id);
+      }
+    } catch {
+      const matched = activeMunicipalities.find((m) => m.id === municipalityId) || defaultMuni;
+      if (matched) {
+        setDetectedAddress(`${matched.name}, Kerala`);
+      }
+    }
+  };
+
+  const detectDeviceGps = () => {
+    setGeoMode('detecting');
+    if (typeof navigator !== 'undefined' && navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          resolveLocationAndAddress(pos.coords.latitude, pos.coords.longitude, 'device');
+        },
+        () => {
+          const fallback = activeMunicipalities.find((m) => m.id === municipalityId) || defaultMuni;
+          if (fallback) {
+            resolveLocationAndAddress(fallback.centerLat, fallback.centerLng, 'area');
+          }
+        },
+        { timeout: 5000, enableHighAccuracy: true }
+      );
+    } else if (defaultMuni) {
+      resolveLocationAndAddress(defaultMuni.centerLat, defaultMuni.centerLng, 'area');
+    }
+  };
+
   useEffect(() => {
     loadSession(phone);
+    detectDeviceGps();
   }, []);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages.length]);
+
+  const handleMunicipalityOverride = (newMuniId: string) => {
+    setMunicipalityId(newMuniId);
+    const m = activeMunicipalities.find((item) => item.id === newMuniId);
+    if (m) {
+      resolveLocationAndAddress(m.centerLat, m.centerLng, 'area');
+    }
+  };
 
   const handlePhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -81,13 +133,13 @@ export const WhatsappBotWidget: React.FC<WhatsappBotWidgetProps> = ({
     setSending(true);
     setError('');
     try {
-      const selectedMuni = activeMunicipalities.find((m) => m.id === municipalityId);
       const res = await api.sendWhatsappMessage({
         phone,
-        message: textToSend || 'Attached civic issue photograph for inspection',
+        message: textToSend || 'Attached civic issue photograph for immediate inspection',
         municipalityId: municipalityId || undefined,
-        latitude: attachGps && selectedMuni ? selectedMuni.centerLat : undefined,
-        longitude: attachGps && selectedMuni ? selectedMuni.centerLng : undefined,
+        latitude: geoLat,
+        longitude: geoLng,
+        addressText: detectedAddress || undefined,
         photoDataUrl: photoDataUrl || undefined,
       });
       setMessages(res.messages);
@@ -96,8 +148,7 @@ export const WhatsappBotWidget: React.FC<WhatsappBotWidgetProps> = ({
       setPhotoDataUrl('');
       if (res.createdIssue) {
         onIssueCreated?.(res.createdIssue);
-      }
-      if (res.linkedIssue && !res.createdIssue) {
+      } else if (res.linkedIssue) {
         onIssueCreated?.(res.linkedIssue);
       }
     } catch (err: any) {
@@ -109,15 +160,17 @@ export const WhatsappBotWidget: React.FC<WhatsappBotWidgetProps> = ({
 
   const quickPrompts = [
     'Hi',
-    'Large pothole flooding St. Mary road in Mulanthuruthy',
-    'Two streetlights dead near Kochi Corporation metro station',
+    'Large pothole flooding the main road near school',
+    'Two streetlights dead near metro junction',
     'Status PWD-2026-00125',
   ];
+
+  const selectedMuniObj = activeMunicipalities.find((m) => m.id === municipalityId);
 
   const shellContent = (
     <div
       className={`flex flex-col bg-white border border-slate-200 overflow-hidden ${
-        mode === 'drawer' ? 'h-full w-full' : 'rounded-xl h-[620px]'
+        mode === 'drawer' ? 'h-full w-full' : 'rounded-xl h-[640px]'
       }`}
     >
       {/* WhatsApp Civic Header */}
@@ -129,9 +182,9 @@ export const WhatsappBotWidget: React.FC<WhatsappBotWidgetProps> = ({
           <div className="min-w-0">
             <div className="text-sm font-bold truncate">Civil Setu WhatsApp Civic Bot</div>
             <div className="text-[11px] text-emerald-100 flex items-center gap-1.5">
-              <span>24x7 Automated Complaint Intake & Tracking</span>
+              <span>Civilian Reporting · Auto-GPS Dispatch</span>
               <span>·</span>
-              <span>{cloudApiConfigured ? 'Cloud API Live' : 'Interactive Bot Ready'}</span>
+              <span>Direct Authority Queue Sync</span>
             </div>
           </div>
         </div>
@@ -147,43 +200,68 @@ export const WhatsappBotWidget: React.FC<WhatsappBotWidgetProps> = ({
         )}
       </div>
 
-      {/* Citizen Phone & Optional Place Pin Bar */}
-      <div className="bg-slate-50 border-b border-slate-200 px-4 py-2.5 grid grid-cols-1 sm:grid-cols-2 gap-2.5 shrink-0">
-        <div className="flex items-center gap-2">
-          <Phone className="w-3.5 h-3.5 text-[#075E54] shrink-0" />
-          <input
-            type="text"
-            aria-label="Citizen WhatsApp Phone Number"
-            value={phone}
-            onChange={(e) => setPhone(e.target.value)}
-            onBlur={() => loadSession(phone)}
-            placeholder="+91 98470 20001"
-            className="flex-1 min-w-0 px-2.5 py-1.5 text-xs font-mono border border-slate-300 rounded-lg bg-white"
-          />
-          <button
-            type="button"
-            onClick={() => loadSession(phone)}
-            className="px-2.5 py-1.5 text-[11px] font-semibold text-[#075E54] bg-white border border-slate-300 rounded-lg hover:bg-slate-100 cursor-pointer"
-          >
-            Load
-          </button>
+      {/* Citizen Phone & Auto-Location Status Bar */}
+      <div className="bg-slate-50 border-b border-slate-200 px-4 py-2.5 space-y-2 shrink-0">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+          <div className="flex items-center gap-2">
+            <Phone className="w-3.5 h-3.5 text-[#075E54] shrink-0" />
+            <input
+              type="text"
+              aria-label="Citizen WhatsApp Phone Number"
+              value={phone}
+              onChange={(e) => setPhone(e.target.value)}
+              onBlur={() => loadSession(phone)}
+              placeholder="+91 98470 20001"
+              className="flex-1 min-w-0 px-2.5 py-1.5 text-xs font-mono border border-slate-300 rounded-lg bg-white"
+            />
+            <button
+              type="button"
+              onClick={() => loadSession(phone)}
+              className="px-2.5 py-1.5 text-[11px] font-semibold text-[#075E54] bg-white border border-slate-300 rounded-lg hover:bg-slate-100 cursor-pointer"
+            >
+              Load
+            </button>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <MapPin className="w-3.5 h-3.5 text-[#0D9488] shrink-0" />
+            <select
+              aria-label="WhatsApp Detected Place"
+              value={municipalityId}
+              onChange={(e) => handleMunicipalityOverride(e.target.value)}
+              className="flex-1 min-w-0 px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg bg-white"
+            >
+              {activeMunicipalities.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.name} ({m.type})
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              onClick={detectDeviceGps}
+              title="Re-detect live device GPS location"
+              className="inline-flex items-center gap-1 px-2 py-1.5 text-[11px] font-semibold text-[#0B1F3A] bg-white border border-slate-300 rounded-lg hover:bg-slate-100 shrink-0 cursor-pointer"
+            >
+              <Crosshair className="w-3 h-3 text-[#0D9488]" />
+              GPS
+            </button>
+          </div>
         </div>
 
-        <div className="flex items-center gap-2">
-          <MapPin className="w-3.5 h-3.5 text-[#0D9488] shrink-0" />
-          <select
-            aria-label="Optional WhatsApp Location Pin"
-            value={municipalityId}
-            onChange={(e) => setMunicipalityId(e.target.value)}
-            className="flex-1 min-w-0 px-2.5 py-1.5 text-xs border border-slate-300 rounded-lg bg-white"
-          >
-            <option value="">Auto-detect place from message</option>
-            {activeMunicipalities.map((m) => (
-              <option key={m.id} value={m.id}>
-                Pin: {m.name} ({m.type})
-              </option>
-            ))}
-          </select>
+        <div className="flex flex-wrap items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-emerald-50/80 border border-emerald-200 text-[11px] text-[#075E54]">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <MapPin className="w-3 h-3 shrink-0" />
+            <span className="font-semibold shrink-0">
+              {geoMode === 'detecting' ? 'Detecting location...' : 'Auto-Location Ready:'}
+            </span>
+            <span className="truncate">
+              {detectedAddress || `${selectedMuniObj?.name || 'Kerala'} (${geoLat.toFixed(4)}, ${geoLng.toFixed(4)})`}
+            </span>
+          </div>
+          <span className="font-mono text-[10px] shrink-0">
+            GPS {geoLat.toFixed(4)}, {geoLng.toFixed(4)}
+          </span>
         </div>
       </div>
 
@@ -195,13 +273,13 @@ export const WhatsappBotWidget: React.FC<WhatsappBotWidgetProps> = ({
           <div className="bg-white border border-slate-200 rounded-xl p-4 max-w-md text-xs text-slate-700 space-y-2 shadow-xs">
             <div className="font-bold text-[#075E54] flex items-center gap-1.5">
               <Sparkles className="w-3.5 h-3.5" />
-              Civil Setu Civic Assistant
+              Civil Setu Civilian WhatsApp Assistant
             </div>
             <p className="leading-relaxed">
-              Send any road, streetlight, water leak, drainage, or waste issue right here just like WhatsApp. Your complaint is automatically triaged by AI, given a unique <span className="font-mono font-semibold">PWD-2026-XXXXX</span> ID, routed to the exact department, and synced with full administrative controls.
+              Send any road, streetlight, water leak, drainage, or waste issue right here. Your live location and GPS coordinates are captured automatically and transmitted straight to the responsible authority's complaint queue.
             </p>
             <p className="text-[11px] text-slate-500">
-              Try clicking a sample prompt below or typing your own message.
+              Try clicking a quick prompt below, attach a photo, or describe the issue in your own words.
             </p>
           </div>
         ) : (
@@ -235,7 +313,7 @@ export const WhatsappBotWidget: React.FC<WhatsappBotWidgetProps> = ({
                           onClick={() => onOpenComplaint(m.linkedComplaintCode!)}
                           className="inline-flex items-center gap-1 font-mono font-semibold text-[#075E54] hover:underline cursor-pointer"
                         >
-                          Open {m.linkedComplaintCode}
+                          Track {m.linkedComplaintCode}
                           <ExternalLink className="w-3 h-3" />
                         </button>
                       )}
@@ -267,7 +345,7 @@ export const WhatsappBotWidget: React.FC<WhatsappBotWidgetProps> = ({
           ))}
         </div>
 
-        {/* Attachment Status Row */}
+        {/* Attachment & Auto-GPS Status Row */}
         <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-600">
           <div className="flex items-center gap-2">
             <label className="inline-flex items-center gap-1 px-2 py-1 bg-white border border-slate-300 rounded-md cursor-pointer hover:bg-slate-100">
@@ -293,17 +371,12 @@ export const WhatsappBotWidget: React.FC<WhatsappBotWidgetProps> = ({
               </button>
             )}
           </div>
-          <label className="inline-flex items-center gap-1 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={attachGps}
-              onChange={(e) => setAttachGps(e.target.checked)}
-            />
-            <span>Include GPS coordinates</span>
+          <span className="text-[10px] font-medium text-[#075E54]">
+            Location & GPS sent automatically to authority
             {lastAiSource && (
-              <span className="ml-1 font-mono uppercase text-[10px] text-slate-400">({lastAiSource})</span>
+              <span className="ml-1 font-mono uppercase text-slate-400">({lastAiSource})</span>
             )}
-          </label>
+          </span>
         </div>
 
         {/* Message Composer */}
@@ -319,7 +392,7 @@ export const WhatsappBotWidget: React.FC<WhatsappBotWidgetProps> = ({
             aria-label="WhatsApp message"
             value={message}
             onChange={(e) => setMessage(e.target.value)}
-            placeholder="Message Civil Setu Bot (e.g., Broken streetlight near Aluva market)..."
+            placeholder="Describe the civic issue or upload a photo..."
             className="flex-1 px-3.5 py-2 text-xs border border-slate-300 rounded-lg bg-white"
           />
           <button

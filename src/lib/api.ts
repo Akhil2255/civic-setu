@@ -319,13 +319,52 @@ export const api = {
       body: JSON.stringify(payload),
     }),
 
+  reverseGeocode: (latitude: number, longitude: number) =>
+    apiFetch<{
+      latitude: number;
+      longitude: number;
+      addressText: string;
+      nearestMunicipality: MunicipalityRecord | null;
+    }>(`/api/geo/reverse?lat=${encodeURIComponent(latitude)}&lng=${encodeURIComponent(longitude)}`),
+
+  identifyPhoto: (payload: {
+    imageBase64: string;
+    mimeType?: string;
+    filename?: string;
+    municipalityId?: string;
+    addressText?: string;
+    latitude?: number;
+    longitude?: number;
+  }) =>
+    apiFetch<{
+      identified: {
+        title: string;
+        description: string;
+        suggestedCategory: string;
+        severity: string;
+        confidence: number;
+        reasoning: string;
+        source: 'gemini' | 'heuristic';
+      };
+      analysis: AiIssueAnalysis;
+      routing: { routingStatus: string; departmentId: string | null; departmentName: string | null; slaHours: number; reason: string } | null;
+      duplicates: Array<{ id: string; complaintCode: string; title: string; category: string; status: string; distanceMeters: number }>;
+      repeatExcavation: {
+        isRepeatZone: boolean;
+        totalPriorExcavations: number;
+        nearbyPassports: Array<{ passportCode: string; assetName: string; workStatus: string; repeatDigCount: number }>;
+      };
+    }>('/api/ai/identify-photo', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
   getWhatsappSession: (phone?: string) => {
     const qs = phone ? `?phone=${encodeURIComponent(phone)}` : '';
     return apiFetch<{
       session: import('./types').WhatsappSessionRecord | null;
       phoneNumber: string;
       messages: import('./types').WhatsappMessageRecord[];
-      cloudApiConfigured: boolean;
     }>(`/api/whatsapp/session${qs}`);
   },
 
@@ -335,6 +374,7 @@ export const api = {
     municipalityId?: string;
     latitude?: number;
     longitude?: number;
+    addressText?: string;
     photoDataUrl?: string;
   }) =>
     apiFetch<{
@@ -348,16 +388,5 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
-
-  getWhatsappIntakeLogs: () =>
-    apiFetch<{
-      issues: CivicIssue[];
-      recentMessages: import('./types').WhatsappMessageRecord[];
-      integration: {
-        webhookPath: string;
-        verifyTokenConfigured: boolean;
-        appSecretConfigured: boolean;
-        cloudApiConfigured: boolean;
-      };
-    }>('/api/whatsapp/intake-logs'),
 };
+

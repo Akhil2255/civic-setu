@@ -1,4 +1,4 @@
-import { classifyIssueHeuristically } from './routingEngine.ts';
+import { classifyIssueHeuristically, haversineMeters } from './routingEngine.ts';
 import type { IssueSeverity, MunicipalityRecord, WhatsappSessionDraft } from './types.ts';
 
 export type WhatsappBotIntent =
@@ -45,6 +45,28 @@ export function formatPhoneDisplay(normalized: string): string {
     return `+91 ${normalized.slice(3, 8)} ${normalized.slice(8)}`;
   }
   return normalized;
+}
+
+export function matchNearestActiveMunicipality(
+  latitude: number,
+  longitude: number,
+  municipalities: MunicipalityRecord[]
+): MunicipalityRecord | null {
+  if (!Number.isFinite(latitude) || !Number.isFinite(longitude)) return null;
+  const active = municipalities.filter((m) => !m.status || m.status === 'Active');
+  if (active.length === 0) return null;
+
+  let best = active[0];
+  let bestDist = haversineMeters(latitude, longitude, best.centerLat, best.centerLng);
+  for (let i = 1; i < active.length; i += 1) {
+    const candidate = active[i];
+    const dist = haversineMeters(latitude, longitude, candidate.centerLat, candidate.centerLng);
+    if (dist < bestDist) {
+      best = candidate;
+      bestDist = dist;
+    }
+  }
+  return best;
 }
 
 export function matchMunicipalityFromText(
@@ -100,6 +122,8 @@ export function parseWhatsappIntent(params: {
   municipalities: MunicipalityRecord[];
   draft?: WhatsappSessionDraft | null;
   explicitMunicipalityId?: string | null;
+  latitude?: number;
+  longitude?: number;
 }): WhatsappParsedTurn {
   const raw = String(params.message || '').trim();
   const lower = raw.toLowerCase();
@@ -117,7 +141,11 @@ export function parseWhatsappIntent(params: {
         (m) => m.id === params.draft!.municipalityId && (!m.status || m.status === 'Active')
       ) || null
     : null;
-  const matchedMunicipality = explicitMuni || textMuni || draftMuni;
+  const geoMuni =
+    typeof params.latitude === 'number' && typeof params.longitude === 'number'
+      ? matchNearestActiveMunicipality(params.latitude, params.longitude, params.municipalities)
+      : null;
+  const matchedMunicipality = explicitMuni || textMuni || draftMuni || geoMuni;
 
   // 1. Greeting / Help menu
   if (
@@ -242,15 +270,24 @@ export function formatWhatsappConfirmationReply(params: {
   slaHours: number;
   hasRoadPassport: boolean;
   duplicateCode?: string | null;
+  addressText?: string | null;
+  latitude?: number;
+  longitude?: number;
 }): string {
   const lines = [
     `Complaint Registered on Civil Setu`,
     `ID: ${params.complaintCode}`,
     `Issue: ${params.title}`,
     `Category: ${params.category} (${params.severity} priority)`,
-    `Location: ${params.municipalityName}`,
-    `Routed To: ${params.departmentName || 'Manual Review Queue'} (SLA: ${params.slaHours}h)`,
+    `Location: ${params.addressText || params.municipalityName}`,
+    `Municipality: ${params.municipalityName}`,
+    `Routed To Authority: ${params.departmentName || 'Manual Review Queue'} (SLA: ${params.slaHours}h)`,
   ];
+  if (typeof params.latitude === 'number' && typeof params.longitude === 'number') {
+    lines.push(
+      `GPS Coordinates Automatically Sent: ${params.latitude.toFixed(5)}, ${params.longitude.toFixed(5)}`
+    );
+  }
   if (params.hasRoadPassport) {
     lines.push(`Road Passport: Digital road work record created & linked.`);
   }

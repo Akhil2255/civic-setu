@@ -4,6 +4,7 @@ import type { MunicipalityRecord } from './types.ts';
 import {
   formatWhatsappConfirmationReply,
   matchMunicipalityFromText,
+  matchNearestActiveMunicipality,
   normalizePhoneNumber,
   parseWhatsappIntent,
 } from './whatsappBot.ts';
@@ -53,6 +54,23 @@ test('matchMunicipalityFromText matches Active places by name or base town token
   assert.equal(matchMunicipalityFromText('Broken bench at Old Fort Zone', SAMPLE_MUNICIPALITIES), null);
 });
 
+test('matchNearestActiveMunicipality picks nearest Active municipality from GPS coordinates', () => {
+  assert.equal(matchNearestActiveMunicipality(9.899, 76.384, SAMPLE_MUNICIPALITIES)?.id, 'mun-mlt');
+  assert.equal(matchNearestActiveMunicipality(9.958, 76.241, SAMPLE_MUNICIPALITIES)?.id, 'mun-kochi');
+});
+
+test('parseWhatsappIntent auto-resolves municipality from GPS coordinates even when town name is omitted', () => {
+  const autoLocated = parseWhatsappIntent({
+    message: 'Deep pothole blocking left lane near junction',
+    municipalities: SAMPLE_MUNICIPALITIES,
+    latitude: 9.8981,
+    longitude: 76.3854,
+  });
+  assert.equal(autoLocated.intent, 'report_issue');
+  assert.equal(autoLocated.matchedMunicipality?.id, 'mun-mlt');
+  assert.deepEqual(autoLocated.missingFields, []);
+});
+
 test('parseWhatsappIntent recognizes greeting, track_status, verify_issue, and report_issue', () => {
   const greet = parseWhatsappIntent({ message: 'Hi', municipalities: SAMPLE_MUNICIPALITIES });
   assert.equal(greet.intent, 'greeting_help');
@@ -99,7 +117,7 @@ test('parseWhatsappIntent supports multi-turn municipality follow-up from draft'
   assert.deepEqual(turn2.missingFields, []);
 });
 
-test('formatWhatsappConfirmationReply formats structured registration confirmation', () => {
+test('formatWhatsappConfirmationReply formats structured registration confirmation with GPS', () => {
   const reply = formatWhatsappConfirmationReply({
     complaintCode: 'PWD-2026-00134',
     title: 'Deep pothole near school gate',
@@ -109,8 +127,12 @@ test('formatWhatsappConfirmationReply formats structured registration confirmati
     departmentName: 'Public Works Department (PWD)',
     slaHours: 48,
     hasRoadPassport: true,
+    addressText: "St. Mary's Road, Mulanthuruthy",
+    latitude: 9.8981,
+    longitude: 76.3854,
   });
   assert.match(reply, /PWD-2026-00134/);
   assert.match(reply, /Public Works Department/);
   assert.match(reply, /Road Passport/);
+  assert.match(reply, /9\.89810, 76\.38540/);
 });

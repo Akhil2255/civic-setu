@@ -1,7 +1,9 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   Crosshair,
+  Loader2,
+  MapPin,
   Mic,
   MicOff,
   Send,
@@ -22,8 +24,9 @@ interface ReportIssueViewProps {
 
 export const ReportIssueView: React.FC<ReportIssueViewProps> = ({ user, taxonomy, onSubmitted }) => {
   const defaultMuni =
-    taxonomy.municipalities.find((m) => m.id === user.municipalityId) ||
-    taxonomy.municipalities.find((m) => m.id === 'mun-mlt') ||
+    taxonomy.municipalities.find((m) => m.id === user.municipalityId && (!m.status || m.status === 'Active')) ||
+    taxonomy.municipalities.find((m) => m.id === 'mun-mlt' && (!m.status || m.status === 'Active')) ||
+    taxonomy.municipalities.find((m) => !m.status || m.status === 'Active') ||
     taxonomy.municipalities[0];
 
   const [title, setTitle] = useState('');
@@ -40,10 +43,16 @@ export const ReportIssueView: React.FC<ReportIssueViewProps> = ({ user, taxonomy
 
   const [listening, setListening] = useState(false);
   const [voiceStatus, setVoiceStatus] = useState('');
+  const [locatingAddress, setLocatingAddress] = useState(false);
+  const [geoStatus, setGeoStatus] = useState('');
+  const [identifyingPhoto, setIdentifyingPhoto] = useState(false);
+  const [photoAiStatus, setPhotoAiStatus] = useState('');
   const [analyzing, setAnalyzing] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState('');
   const [aiPreview, setAiPreview] = useState<Awaited<ReturnType<typeof api.analyzeIssue>> | null>(null);
+
+  const addressEditedByUser = useRef(false);
 
   const districtsInState = useMemo(
     () => taxonomy.districts.filter((d) => d.stateId === stateId && (!d.status || d.status === 'Active')),
@@ -55,6 +64,68 @@ export const ReportIssueView: React.FC<ReportIssueViewProps> = ({ user, taxonomy
     [taxonomy.municipalities, districtId]
   );
 
+  const applyCoordinatesAndAddress = async (
+    lat: number,
+    lng: number,
+    options?: { forceAddress?: boolean; sourceLabel?: string }
+  ) => {
+    const cleanLat = Number(lat.toFixed(6));
+    const cleanLng = Number(lng.toFixed(6));
+    setLatitude(cleanLat);
+    setLongitude(cleanLng);
+    setLocatingAddress(true);
+    try {
+      const res = await api.reverseGeocode(cleanLat, cleanLng);
+      if (res.addressText && (options?.forceAddress || !addressEditedByUser.current)) {
+        setAddressText(res.addressText);
+        if (options?.forceAddress) {
+          addressEditedByUser.current = false;
+        }
+      }
+      if (res.nearestMunicipality) {
+        setStateId(res.nearestMunicipality.stateId);
+        setDistrictId(res.nearestMunicipality.districtId);
+        setMunicipalityId(res.nearestMunicipality.id);
+      }
+      setGeoStatus(
+        options?.sourceLabel
+          ? `Street address auto-filled from ${options.sourceLabel}.`
+          : 'Street address auto-filled from your location.'
+      );
+    } catch {
+      const m = taxonomy.municipalities.find((item) => item.id === municipalityId) || defaultMuni;
+      if (m && (options?.forceAddress || !addressEditedByUser.current)) {
+        setAddressText(`${m.name} Main Road, Kerala`);
+      }
+    } finally {
+      setLocatingAddress(false);
+    }
+  };
+
+  useEffect(() => {
+    if (typeof navigator !== 'undefined' && navigator.geolocation) {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          applyCoordinatesAndAddress(pos.coords.latitude, pos.coords.longitude, {
+            sourceLabel: 'device GPS',
+          });
+        },
+        () => {
+          if (defaultMuni) {
+            applyCoordinatesAndAddress(defaultMuni.centerLat, defaultMuni.centerLng, {
+              sourceLabel: 'local area coordinates',
+            });
+          }
+        },
+        { timeout: 5000, enableHighAccuracy: true }
+      );
+    } else if (defaultMuni) {
+      applyCoordinatesAndAddress(defaultMuni.centerLat, defaultMuni.centerLng, {
+        sourceLabel: 'local area coordinates',
+      });
+    }
+  }, []);
+
   const handleDistrictChange = (newDistrictId: string) => {
     setDistrictId(newDistrictId);
     const firstMuni = taxonomy.municipalities.find(
@@ -62,8 +133,10 @@ export const ReportIssueView: React.FC<ReportIssueViewProps> = ({ user, taxonomy
     );
     if (firstMuni) {
       setMunicipalityId(firstMuni.id);
-      setLatitude(firstMuni.centerLat);
-      setLongitude(firstMuni.centerLng);
+      applyCoordinatesAndAddress(firstMuni.centerLat, firstMuni.centerLng, {
+        forceAddress: !addressEditedByUser.current,
+        sourceLabel: `${firstMuni.name} boundary`,
+      });
     } else {
       setMunicipalityId('');
     }
@@ -73,8 +146,51 @@ export const ReportIssueView: React.FC<ReportIssueViewProps> = ({ user, taxonomy
     setMunicipalityId(newMuniId);
     const m = taxonomy.municipalities.find((item) => item.id === newMuniId);
     if (m) {
-      setLatitude(m.centerLat);
-      setLongitude(m.centerLng);
+      applyCoordinatesAndAddress(m.centerLat, m.centerLng, {
+        forceAddress: !addressEditedByUser.current,
+        sourceLabel: `${m.name} boundary`,
+      });
+    }
+  };
+
+  const identifyAndAutofillFromPhoto = async (dataUrl: string, filename?: string) => {
+    setPhotoDataUrl(dataUrl);
+    setIdentifyingPhoto(true);
+    setPhotoAiStatus('AI is analyzing your uploaded photo to identify the issue...');
+    setError('');
+    try {
+      const res = await api.identifyPhoto({
+        imageBase64: dataUrl,
+        mimeType: dataUrl.startsWith('data:image/png') ? 'image/png' : 'image/jpeg',
+        filename,
+        municipalityId,
+        addressText: addressText || undefined,
+        latitude,
+        longitude,
+      });
+
+      setTitle(res.identified.title);
+      setDescription(res.identified.description);
+      const validCategories = new Set([
+        ...DEFAULT_ISSUE_CATEGORIES,
+        ...taxonomy.categories.map((c) => c.name),
+      ]);
+      if (validCategories.has(res.identified.suggestedCategory)) {
+        setCategory(res.identified.suggestedCategory);
+      }
+      setAiPreview({
+        analysis: res.analysis,
+        routing: res.routing,
+        duplicates: res.duplicates,
+        repeatExcavation: res.repeatExcavation,
+      });
+      setPhotoAiStatus(
+        `AI (${res.identified.source === 'gemini' ? 'Gemini Vision' : 'Vision Triage'}) auto-filled Issue Title, Description & Category (${Math.round(res.identified.confidence * 100)}% confidence).`
+      );
+    } catch (err: any) {
+      setPhotoAiStatus('Photo attached. You can enter or refine title and description below.');
+    } finally {
+      setIdentifyingPhoto(false);
     }
   };
 
@@ -82,25 +198,39 @@ export const ReportIssueView: React.FC<ReportIssueViewProps> = ({ user, taxonomy
     const file = e.target.files?.[0];
     if (!file) return;
     const reader = new FileReader();
-    reader.onload = () => setPhotoDataUrl(String(reader.result || ''));
+    reader.onload = () => {
+      const resultUrl = String(reader.result || '');
+      if (resultUrl) {
+        identifyAndAutofillFromPhoto(resultUrl, file.name);
+      }
+    };
     reader.readAsDataURL(file);
   };
 
   const handleCaptureGps = () => {
     if (!navigator.geolocation) {
-      setError('Browser geolocation is unavailable. Click on the map below to pin the exact spot.');
+      applyCoordinatesAndAddress(latitude, longitude, {
+        forceAddress: true,
+        sourceLabel: 'pinned map coordinates',
+      });
       return;
     }
+    setLocatingAddress(true);
     navigator.geolocation.getCurrentPosition(
       (pos) => {
-        setLatitude(Number(pos.coords.latitude.toFixed(6)));
-        setLongitude(Number(pos.coords.longitude.toFixed(6)));
+        applyCoordinatesAndAddress(pos.coords.latitude, pos.coords.longitude, {
+          forceAddress: true,
+          sourceLabel: 'live device GPS',
+        });
         setError('');
       },
       () => {
-        setError('Unable to read device GPS permission. Use the interactive map pin picker instead.');
+        applyCoordinatesAndAddress(latitude, longitude, {
+          forceAddress: true,
+          sourceLabel: 'pinned map coordinates',
+        });
       },
-      { timeout: 6000 }
+      { timeout: 6000, enableHighAccuracy: true }
     );
   };
 
@@ -133,7 +263,7 @@ export const ReportIssueView: React.FC<ReportIssueViewProps> = ({ user, taxonomy
 
   const handleRunAiPreview = async () => {
     if (!title.trim() || !description.trim()) {
-      setError('Enter both an issue title and description to run AI analysis.');
+      setError('Enter both an issue title and description (or upload a photo) to run AI analysis.');
       return;
     }
     setAnalyzing(true);
@@ -192,7 +322,7 @@ export const ReportIssueView: React.FC<ReportIssueViewProps> = ({ user, taxonomy
       <div>
         <h1 className="text-2xl font-bold text-[#0B1F3A] tracking-tight">Report a Public Infrastructure Issue</h1>
         <p className="text-sm text-slate-600">
-          Submit geo-tagged evidence. Our AI triage and jurisdiction engine automatically routes your complaint to the responsible authority.
+          Upload a photo and AI will automatically identify the issue title, description, and category, while your GPS pin auto-fills the exact street address.
         </p>
       </div>
 
@@ -201,6 +331,83 @@ export const ReportIssueView: React.FC<ReportIssueViewProps> = ({ user, taxonomy
       <form onSubmit={handleSubmit} className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* Left Column: Issue Form */}
         <div className="lg:col-span-7 bg-white border border-slate-200 rounded-xl p-6 space-y-5">
+          {/* Photo & Video Upload placed prominently so photo upload auto-fills form */}
+          <div className="space-y-3 p-4 rounded-xl bg-slate-50 border border-slate-200">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="text-xs font-bold text-[#0B1F3A] flex items-center gap-1.5">
+                <Sparkles className="w-3.5 h-3.5 text-[#0D9488]" />
+                <span>Upload Issue Photo (AI Auto-Identifies Issue Details)</span>
+              </div>
+              {identifyingPhoto && (
+                <span className="inline-flex items-center gap-1 text-xs font-semibold text-[#0D9488]">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  Identifying...
+                </span>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-semibold text-white bg-[#0B1F3A] rounded-lg cursor-pointer hover:bg-slate-800">
+                <Upload className="w-4 h-4 text-teal-300" />
+                <span>{photoDataUrl ? 'Change Photo' : 'Upload Photo'}</span>
+                <input type="file" accept="image/*" onChange={handlePhotoUpload} className="hidden" />
+              </label>
+
+              <label className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-semibold text-[#0B1F3A] bg-white border border-slate-300 rounded-lg cursor-pointer hover:bg-slate-100">
+                <Video className="w-4 h-4 text-slate-600" />
+                <span>{videoName ? `Video: ${videoName}` : 'Attach Video Clip'}</span>
+                <input
+                  type="file"
+                  accept="video/*"
+                  onChange={(e) => setVideoName(e.target.files?.[0]?.name || '')}
+                  className="hidden"
+                />
+              </label>
+
+              <button
+                type="button"
+                disabled={identifyingPhoto}
+                onClick={() =>
+                  identifyAndAutofillFromPhoto(
+                    '/src/assets/images/sample_pothole_before_1795365318496.jpg',
+                    'sample_pothole_before.jpg'
+                  )
+                }
+                className="text-xs font-semibold text-[#0D9488] hover:underline cursor-pointer disabled:opacity-50"
+              >
+                Use Sample Kerala Pothole Photo
+              </button>
+            </div>
+
+            {photoAiStatus && (
+              <div className="text-xs font-medium text-[#075E54] bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2">
+                {photoAiStatus}
+              </div>
+            )}
+
+            {photoDataUrl && (
+              <div className="flex items-center gap-4 p-3 rounded-lg border border-slate-200 bg-white">
+                <img
+                  src={photoDataUrl}
+                  alt="Issue evidence preview"
+                  className="w-24 h-18 object-cover rounded border border-slate-200"
+                />
+                <div className="text-xs text-slate-600 space-y-1">
+                  <div className="font-semibold text-[#0B1F3A]">Evidence attached</div>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPhotoDataUrl('');
+                      setPhotoAiStatus('');
+                    }}
+                    className="text-red-700 hover:underline cursor-pointer"
+                  >
+                    Remove photo
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+
           <div>
             <label htmlFor="issue-title" className="block text-xs font-semibold text-slate-800 mb-1.5">
               Issue Title
@@ -211,7 +418,7 @@ export const ReportIssueView: React.FC<ReportIssueViewProps> = ({ user, taxonomy
               required
               value={title}
               onChange={(e) => setTitle(e.target.value)}
-              placeholder="e.g., Deep pothole near Mulanthuruthy Government School gate"
+              placeholder="Upload a photo to auto-fill, or type title (e.g., Deep pothole near school gate)"
               className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#0D9488]"
             />
           </div>
@@ -236,7 +443,7 @@ export const ReportIssueView: React.FC<ReportIssueViewProps> = ({ user, taxonomy
               required
               value={description}
               onChange={(e) => setDescription(e.target.value)}
-              placeholder="Describe exact landmark, safety risk, traffic impact, or duration..."
+              placeholder="Upload a photo to auto-fill, or describe exact landmark, safety risk, traffic impact..."
               className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-[#0D9488]"
             />
             {voiceStatus && <p className="text-xs text-slate-500 mt-1">{voiceStatus}</p>}
@@ -323,68 +530,37 @@ export const ReportIssueView: React.FC<ReportIssueViewProps> = ({ user, taxonomy
           </div>
 
           <div>
-            <label htmlFor="issue-address" className="block text-xs font-semibold text-slate-800 mb-1.5">
-              Street Address / Landmark
-            </label>
+            <div className="flex items-center justify-between gap-2 mb-1.5">
+              <label htmlFor="issue-address" className="block text-xs font-semibold text-slate-800">
+                Street Address / Landmark
+              </label>
+              <span className="inline-flex items-center gap-1 text-[11px] text-[#0D9488] font-medium">
+                {locatingAddress ? (
+                  <>
+                    <Loader2 className="w-3 h-3 animate-spin" />
+                    Detecting street address...
+                  </>
+                ) : (
+                  geoStatus && (
+                    <>
+                      <MapPin className="w-3 h-3" />
+                      {geoStatus}
+                    </>
+                  )
+                )}
+              </span>
+            </div>
             <input
               id="issue-address"
               type="text"
               value={addressText}
-              onChange={(e) => setAddressText(e.target.value)}
-              placeholder="e.g., Opposite St. Mary's HS School Gate, Mulanthuruthy"
+              onChange={(e) => {
+                addressEditedByUser.current = true;
+                setAddressText(e.target.value);
+              }}
+              placeholder="Detecting street address from your GPS location..."
               className="w-full px-3.5 py-2.5 text-sm border border-slate-300 rounded-lg"
             />
-          </div>
-
-          {/* Photo & Video Upload */}
-          <div className="space-y-3 pt-1">
-            <div className="text-xs font-semibold text-slate-800">Photographic / Video Evidence</div>
-            <div className="flex flex-wrap items-center gap-3">
-              <label className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-semibold text-[#0B1F3A] bg-slate-50 border border-slate-300 rounded-lg cursor-pointer hover:bg-slate-100">
-                <Upload className="w-4 h-4 text-[#0D9488]" />
-                <span>{photoDataUrl ? 'Change Photo' : 'Upload Photo'}</span>
-                <input type="file" accept="image/*" onChange={handlePhotoUpload} className="hidden" />
-              </label>
-
-              <label className="inline-flex items-center gap-2 px-3.5 py-2 text-xs font-semibold text-[#0B1F3A] bg-slate-50 border border-slate-300 rounded-lg cursor-pointer hover:bg-slate-100">
-                <Video className="w-4 h-4 text-slate-600" />
-                <span>{videoName ? `Video: ${videoName}` : 'Attach Video Clip'}</span>
-                <input
-                  type="file"
-                  accept="video/*"
-                  onChange={(e) => setVideoName(e.target.files?.[0]?.name || '')}
-                  className="hidden"
-                />
-              </label>
-
-              <button
-                type="button"
-                onClick={() => setPhotoDataUrl('/src/assets/images/sample_pothole_before_1795365318496.jpg')}
-                className="text-xs font-medium text-[#0D9488] hover:underline"
-              >
-                Use Sample Kerala Pothole Photo
-              </button>
-            </div>
-
-            {photoDataUrl && (
-              <div className="flex items-center gap-4 p-3 rounded-lg border border-slate-200 bg-slate-50">
-                <img
-                  src={photoDataUrl}
-                  alt="Issue evidence preview"
-                  className="w-24 h-18 object-cover rounded border border-slate-200"
-                />
-                <div className="text-xs text-slate-600 space-y-1">
-                  <div className="font-semibold text-[#0B1F3A]">Evidence attached</div>
-                  <button
-                    type="button"
-                    onClick={() => setPhotoDataUrl('')}
-                    className="text-red-700 hover:underline"
-                  >
-                    Remove photo
-                  </button>
-                </div>
-              </div>
-            )}
           </div>
 
           <div className="flex flex-wrap items-center gap-3 pt-3 border-t border-slate-200">
@@ -415,15 +591,15 @@ export const ReportIssueView: React.FC<ReportIssueViewProps> = ({ user, taxonomy
             <div className="flex items-center justify-between gap-2">
               <div>
                 <h2 className="text-sm font-bold text-[#0B1F3A]">Pin Exact Location on Map</h2>
-                <p className="text-xs text-slate-500">Click anywhere on the map or capture device GPS.</p>
+                <p className="text-xs text-slate-500">Auto-detects your address; click map or Capture GPS to update.</p>
               </div>
               <button
                 type="button"
                 onClick={handleCaptureGps}
-                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#0B1F3A] border border-slate-300 rounded-lg hover:bg-slate-50 whitespace-nowrap"
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-[#0B1F3A] border border-slate-300 rounded-lg hover:bg-slate-50 whitespace-nowrap cursor-pointer"
               >
                 <Crosshair className="w-3.5 h-3.5 text-[#0D9488]" />
-                Capture GPS
+                Capture GPS & Address
               </button>
             </div>
 
@@ -435,8 +611,10 @@ export const ReportIssueView: React.FC<ReportIssueViewProps> = ({ user, taxonomy
               zoom={13}
               heightClass="h-[290px]"
               onSelectLocation={(lat, lng) => {
-                setLatitude(lat);
-                setLongitude(lng);
+                applyCoordinatesAndAddress(lat, lng, {
+                  forceAddress: true,
+                  sourceLabel: 'pinned map location',
+                });
               }}
             />
 
